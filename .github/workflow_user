@@ -1,0 +1,237 @@
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
+//RTOS
+#include "thread.h"
+#include "bsp.h"
+#include "util.h"
+#include "nb_thread.h"
+#include "AepServicecodes.h"
+
+/**************************** define ****************************************/
+
+#define app_log(...)  os_log("\r\n[app_log]");os_log(__VA_ARGS__);
+
+/*********************************vriable*************************************/
+THREAD_INIT(app_process, "aep Thread");
+
+// USER varibale
+static BSP_status_t  BSP_status;
+
+static soft_timer_t  *nb_timer;
+static unsigned int  reportPeriod = 3000;
+static bool          reportFlag = false;
+/*是否登录*/
+static bool 				 updateRegStatus = false;
+extern char NB_IMEI[];
+extern char NB_ICCID[];
+extern int cell_id;
+extern int ecl;
+extern int pci;
+extern int rsrp;
+extern int sinr;
+int8_t alert_signal=0;
+int8_t autowatering_signal=0;
+char autowatering_value=0;
+char security_warning=0;
+
+void nb_update_reg(bool isReRegistered)
+{
+	updateRegStatus = isReRegistered;
+}
+bool nb_get_updateRegStatus(void)
+{
+	return updateRegStatus;
+}
+/******************************** functions ********************************/
+static void nb_timer_cb(void *args);
+
+static void send_data_asy_callback(uint8_t result, uint32_t id)
+{
+	app_log("send syn ack, result:%d,messageID:%d\r\n", result, id);
+	
+	switch( result )
+	{
+		case SEND_SYN_RSP_SUCCESS:
+			break;
+		
+		case SEND_SYN_RSP_TIMEOUT:
+			break;
+		
+		case SEND_SYN_RSP_SENDFAILED:
+			break;
+		
+		case SEND_SYN_RSP_RESET_MESSAGE:
+			break;
+		
+		case SEND_SYN_RSP_WAITING:
+			break;
+		
+		case SEND_SYN_RSP_NOTSEND:
+			break;
+		
+		default:
+			app_log("invalid syn ack!\r\n");
+			break;
+	}
+}
+static void getSignalStatus(signal_report* reportData)
+{
+	reportData->cell_id = cell_id;//cell_id;
+	reportData->ecl = ecl;//ecl;
+	reportData->pci = pci;//pci;
+	reportData->rsrp = rsrp;//rsrp;
+	reportData->sinr = sinr;//sinr;
+	app_log("reportData->cell_id=%d,reportData->ecl=%d,reportData->pci=%d,reportData->rsrp=%d,reportData->sinr=%d\r\n",reportData->cell_id,reportData->ecl,reportData->pci,reportData->rsrp,reportData->sinr);
+}
+static void send_data_syn_callback(void *msg)
+{
+	msg_data_t *m_msg = msg;
+
+	if( m_msg == NULL )
+		return;
+	
+	if( m_msg->result == SEND_ASY_RSP_SUCCESS )
+	{
+		app_log("send asy ack, messageID:%d\r\n",m_msg->messageID);
+	}
+	else if( m_msg->result == SEND_ASY_RSP_FAIL )
+	{
+		if( m_msg->messageID != 0 )
+		{
+			app_log("send error, error id:%d\r\n",m_msg->messageID);
+		}
+		else
+		{
+			app_log("send error\r\n");
+		}
+	}
+	else if( m_msg->result == SEND_ASY_RSP_TIMEOUT )
+	{
+		app_log("send error, mudule ack timeout\r\n");
+	}
+	else if( m_msg->result ==  SEND_ASY_RSP_SENDING )
+	{
+		app_log("last msg(id=%d) in sending,not send CON or NON data\r\n",m_msg->messageID);
+	}
+	
+	if( m_msg->mode == SEND_MODE_NON || m_msg->mode == SEND_MODE_NON_RELEASE || m_msg->mode == SEND_MODE_NON_RELEASE_AFTER_REPLY)
+	{
+		
+	}
+	else if( m_msg->mode == SEND_MODE_CON || m_msg->mode == SEND_MODE_CON_RELEASE_AFTER_REPLY )
+	{
+		
+	}
+	
+	//user can save messageID
+	free(m_msg);
+}
+
+static int8_t send_msg(char *data, uint32_t len, uint8_t mode)
+{
+	int8_t ret;
+	msg_data_t *msg;
+	
+	if( data == NULL || strlen(data) != len )
+	{
+		app_log("nb send params error:%d,%d\r\n",strlen(data),len);
+		return -1;
+	}
+	
+	msg = malloc(sizeof(msg_data_t));
+	if( msg != NULL )
+	{
+		memcpy(msg->send_buff, data, len+1); 
+		msg->mode = mode;
+		msg->len = len;
+		msg->callback = send_data_syn_callback;
+		
+		ret = nb_send(msg);
+		if( ret < 0 )
+		{
+			free(msg);
+		}
+	}
+	else
+	{
+		app_log("malloc error\r\n");
+		ret = -1;
+	}
+	
+	return ret;
+}
+
+/*************************************************************************************/
+static void send_ir_sensor_data(void)
+{
+	int8_t ret;
+	ir_sensor_report reportFlag;
+	AepString      reportstr;
+	
+	getStatus(IR, &BSP_status);
+	
+	//fill sensor data
+	reportFlag.ir_sensor_data = BSP_status.IR_status;
+	if(reportFlag.ir_sensor_data == 0)
+	{
+		reportFlag.ir_sensor_data = 1;
+	}
+	else
+	{
+		reportFlag.ir_sensor_data = 0;
+	}
+	reportstr = ir_sensor_report_CodeEventReport(reportFlag);
+	app_log(reportstr.str);
+	
+  ret = send_msg(reportstr.str, reportstr.len, SEND_MODE_CON);
+	if( ret < 0 )
+	{
+		app_log("send ir sensor data err\r\n");
+	}
+	
+	free(reportstr.str);
+}
+
+static void send_alert_data(void)
+{
+	int8_t ret;
+	alert_warning reportFlag;
+	AepString      reportstr;
+	
+	getStatus(IR, &BSP_status);
+	
+	//fill sensor data
+	reportFlag.warning_detect = security_warning;
+/*	if(reportFlag.ir_sensor_data == 0)
+	{
+		reportFlag.ir_sensor_data = 1;
+	}
+	else
+	{
+		reportFlag.ir_sensor_data = 0;
+	}
+	*/
+	reportstr = alert_warning_CodeEventReport(reportFlag);
+	app_log(reportstr.str);
+	
+  ret = send_msg(reportstr.str, reportstr.len, SEND_MODE_CON);
+	if( ret < 0 )
+	{
+		app_log("send alert_warning err\r\n");
+	}
+	
+	free(reportstr.str);
+}
+static void send_autowatering_data(void)
+{
+	int8_t ret;
+	autowatering_upload reportFlag;
+	AepString      reportstr;
+	
+	getStatus(IR, &BSP_status);
+	
+	//fill sensor data
+	reportFlag.autowatering_d
